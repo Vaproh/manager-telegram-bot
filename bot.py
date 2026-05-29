@@ -223,6 +223,7 @@ def build_accounts_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
 async def set_commands(app: Application) -> None:
     commands = [
         BotCommand("start", "🤖 Show bot menu"),
+        BotCommand("help", "❓ Show bot help"),
         BotCommand("add", "➕ Add one account"),
         BotCommand("bulkadd", "📥 Add many accounts"),
         BotCommand("getaccounts", "📂 Retrieve unused accounts"),
@@ -242,6 +243,13 @@ async def set_commands(app: Application) -> None:
         BotCommand("export", "💾 Export accounts as CSV"),
     ]
     await app.bot.set_my_commands(commands)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    await start(update, context)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1104,6 +1112,7 @@ def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("bulkadd", bulkadd))
     app.add_handler(CommandHandler("getaccounts", getaccounts))
