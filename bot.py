@@ -88,6 +88,9 @@ pending_adds: dict[int, dict] = {}
 pending_bulk: dict[int, dict] = {}
 pending_gets: dict[int, dict] = {}
 pending_bulk_delete: dict[int, str] = {}
+pending_bulk_delete_confirm: dict[int, str] = {}
+pending_delete_confirm: dict[int, int] = {}
+pending_delete_category_confirm: dict[int, str] = {}
 pending_csv_extract: dict[int, bool] = {}
 
 
@@ -276,7 +279,6 @@ async def set_commands(app: Application) -> None:
         BotCommand("accounts", "👥 Manage account used status"),
         BotCommand("list", "📋 Browse accounts by page"),
         BotCommand("bulkdelete", "🗑️ Bulk delete accounts"),
-        BotCommand("setstatus", "🧭 Set account used/unused by ID"),
         BotCommand("extractcsv", "📄 Extract User/Email + Password from CSV"),
         BotCommand("stats", "📊 Show statistics"),
         BotCommand("export", "💾 Export accounts as CSV"),
@@ -298,7 +300,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"<b>🤖 {esc(BOT_NAME)}</b>\n"
         f"<i>🔐 Private vault for {esc(SERVICE_NAME)} credentials</i>\n\n"
-        f"<b>✨ Quick commands</b>\n"
+        f"<b>✨ Quick menu</b>\n"
         f"• /add — ➕ save one account\n"
         f"• /bulkadd — 📥 import multiple accounts\n"
         f"• /getaccounts — 📂 pull unused accounts\n"
@@ -317,7 +319,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• /stats — 📊 see bot usage stats\n"
         f"• /export — 💾 export the full account list"
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=main_menu_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,18 +413,25 @@ async def deletecategory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     name = normalize_name(" ".join(context.args))
-    ok, message = delete_category(name)
-    if ok:
-        logger.info("Category deleted: %s by user %s", name, update.effective_user.id)
+    if get_category_id_by_name(name) is None:
         await update.effective_message.reply_text(
-            f"<b>🗑️ Category deleted</b>\n<code>{esc(name)}</code>\n<blockquote>Accounts moved to uncategorized.</blockquote>",
+            f"<b>❌ Category not found</b>\n<code>{esc(name)}</code>",
             parse_mode=ParseMode.HTML,
         )
-    else:
-        await update.effective_message.reply_text(
-            f"<b>❌ Could not delete category</b>\n<code>{esc(message)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        return
+
+    pending_delete_category_confirm[update.effective_user.id] = name
+    await update.effective_message.reply_text(
+        f"<b>⚠️ Delete category</b> <code>{esc(name)}</code>?\n"
+        "All accounts in this category will be moved to uncategorized.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"delcatconfirm:{esc(name)}"),
+                InlineKeyboardButton("❌ Cancel", callback_data="delcatcancel:0"),
+            ]
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -440,15 +453,38 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed_guard(update):
         return
 
-    if not context.args:
+    raw = " ".join(context.args).strip()
+    if not raw:
         await update.effective_message.reply_text(
-            "<b>Usage</b>\n<code>🔎 /search term</code>",
+            "<b>Usage</b>\n"
+            "<code>🔎 /search term</code>\n"
+            "Examples:\n"
+            "• /search gmail\n"
+            "• /search category:finance used\n"
+            "• /search old password oldest",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    term = " ".join(context.args)
-    rows = search_accounts(term)
+    tokens = raw.split()
+    category = None
+    used = None
+    newest_first = True
+
+    filtered_tokens = []
+    for token in tokens:
+        lower = token.lower()
+        if lower.startswith("category:") or lower.startswith("cat:"):
+            category = token.split(":", 1)[1].strip()
+        elif lower in ("used", "unused"):
+            used = lower == "used"
+        elif lower in ("newest", "oldest"):
+            newest_first = lower == "newest"
+        else:
+            filtered_tokens.append(token)
+
+    term = " ".join(filtered_tokens).strip()
+    rows = search_accounts(term, category=category, used=used, newest_first=newest_first)
 
     if not rows:
         await update.effective_message.reply_text(
@@ -457,7 +493,16 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    parts = [f"<b>Search results for</b> <code>{esc(term)}</code>"]
+    filters = []
+    if category:
+        filters.append(f"Category: <code>{esc(category)}</code>")
+    if used is not None:
+        filters.append(f"Status: <code>{'used' if used else 'unused'}</code>")
+    filters.append(f"Sort: <code>{'newest' if newest_first else 'oldest'}</code>")
+
+    parts = [f"<b>Search results for</b> <code>{esc(term or 'all')}</code>"]
+    if filters:
+        parts.append("• " + " | ".join(filters))
     for row in rows[:20]:
         parts.append(
             "╭──────────────────────────\n"
@@ -487,18 +532,25 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("<b>❗ Account ID must be a number</b>", parse_mode=ParseMode.HTML)
         return
 
-    ok = delete_account(account_id)
-    if ok:
-        logger.info("Account deleted: %s by user %s", account_id, update.effective_user.id)
-        await update.effective_message.reply_text(
-            f"<b>🗑️ Deleted account</b>\n<code>{account_id}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
+    if not get_account_by_id(account_id):
         await update.effective_message.reply_text(
             f"<b>❌ No account found with ID</b> <code>{account_id}</code>",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    pending_delete_confirm[update.effective_user.id] = account_id
+    await update.effective_message.reply_text(
+        f"<b>⚠️ Delete account #{account_id}?</b>\n"
+        "This action cannot be undone.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm delete", callback_data=f"delconfirm:{account_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data="delcancel:0"),
+            ]
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,7 +625,18 @@ async def bulkdelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         raw = " ".join(context.args)
-        await _bulk_delete_from_input(update, raw)
+        pending_bulk_delete_confirm[update.effective_user.id] = raw
+        await update.effective_message.reply_text(
+            "<b>⚠️ Confirm bulk deletion</b>\n"
+            "This will remove all matching accounts permanently.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Confirm delete", callback_data="bulkconfirm:1"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="bulkcancel:0"),
+                ]
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     pending_bulk_delete[update.effective_user.id] = "active"
@@ -582,45 +645,6 @@ async def bulkdelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send account IDs separated by spaces or commas, or a category name to delete all accounts in that category.",
         parse_mode=ParseMode.HTML,
     )
-
-
-async def setstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_guard(update):
-        return
-
-    if len(context.args) < 2:
-        await update.effective_message.reply_text(
-            "<b>Usage</b>\n<code>🧭 /setstatus used 1 2 3</code> or <code>/setstatus unused 4</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    status = context.args[0].lower()
-    if status not in ("used", "unused"):
-        await update.effective_message.reply_text("<b>❗ Status must be used or unused</b>", parse_mode=ParseMode.HTML)
-        return
-
-    ids = []
-    for token in context.args[1:]:
-        try:
-            ids.append(int(token))
-        except ValueError:
-            continue
-
-    if not ids:
-        await update.effective_message.reply_text("<b>❗ No valid account IDs found</b>", parse_mode=ParseMode.HTML)
-        return
-
-    updated = 0
-    for account_id in ids:
-        if set_account_used(account_id, status == "used"):
-            updated += 1
-
-    await update.effective_message.reply_text(
-        f"<b>🧭 Updated {updated} account(s)</b> to <code>{status}</code>",
-        parse_mode=ParseMode.HTML,
-    )
-    logger.info("Set status %s for account ids=%s by user %s", status, ids, update.effective_user.id)
 
 
 async def extractcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -916,6 +940,29 @@ async def handle_category_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
 
+async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    action = query.data.split(":", 1)[1] if ":" in query.data else ""
+    help_text = {
+        "add": "Use /add <username> <password> to save one account.",
+        "get": "Use /getaccounts to retrieve unused accounts from a category.",
+        "accounts": "Use /accounts to review and toggle used/unused accounts.",
+        "list": "Use /list to browse your account inventory page by page.",
+        "search": "Use /search <term> or add filters like category:finance used newest.",
+        "stats": "Use /stats to see account and retrieval summaries.",
+    }.get(action, "Choose an action from the menu.")
+
+    await query.edit_message_text(f"<b>✨ Quick action</b>\n{help_text}", parse_mode=ParseMode.HTML)
+
+
 async def handle_session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed_guard(update):
         return
@@ -1016,6 +1063,59 @@ async def handle_session_callback(update: Update, context: ContextTypes.DEFAULT_
 
         text, reply_markup = build_accounts_page(page)
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        return
+
+    if query.data.startswith("delconfirm:"):
+        try:
+            account_id = int(query.data.split(":", 1)[1])
+        except ValueError:
+            await query.answer("Invalid account.")
+            return
+
+        ok = delete_account(account_id)
+        pending_delete_confirm.pop(query.from_user.id, None)
+        if ok:
+            await query.edit_message_text(f"<b>🗑️ Deleted account</b> <code>{account_id}</code>", parse_mode=ParseMode.HTML)
+        else:
+            await query.edit_message_text(f"<b>❌ Could not delete account</b> <code>{account_id}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data.startswith("delcancel:"):
+        pending_delete_confirm.pop(query.from_user.id, None)
+        await query.edit_message_text("<b>❌ Deletion cancelled</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data.startswith("delcatconfirm:"):
+        name = query.data.split(":", 1)[1]
+        name = html.unescape(name)
+        pending_delete_category_confirm.pop(query.from_user.id, None)
+        ok, message = delete_category(name)
+        if ok:
+            await query.edit_message_text(
+                f"<b>🗑️ Category deleted</b>\n<code>{esc(name)}</code>\n<blockquote>Accounts moved to uncategorized.</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.edit_message_text(f"<b>❌ Could not delete category</b>\n<code>{esc(message)}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data.startswith("delcatcancel:"):
+        pending_delete_category_confirm.pop(query.from_user.id, None)
+        await query.edit_message_text("<b>❌ Category deletion cancelled</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if query.data.startswith("bulkconfirm:"):
+        raw = pending_bulk_delete_confirm.pop(query.from_user.id, None)
+        if not raw:
+            await query.edit_message_text("<b>⏳ Confirmation expired</b>", parse_mode=ParseMode.HTML)
+            return
+        await query.edit_message_text("<b>🗑️ Deleting matching accounts…</b>", parse_mode=ParseMode.HTML)
+        await _bulk_delete_from_input(update, raw)
+        return
+
+    if query.data.startswith("bulkcancel:"):
+        pending_bulk_delete_confirm.pop(query.from_user.id, None)
+        await query.edit_message_text("<b>❌ Bulk deletion cancelled</b>", parse_mode=ParseMode.HTML)
         return
 
     if query.data.startswith("listpage:"):
@@ -1200,13 +1300,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("list", list_accounts_cmd))
     app.add_handler(CommandHandler("bulkdelete", bulkdelete))
-    app.add_handler(CommandHandler("setstatus", setstatus))
     app.add_handler(CommandHandler("extractcsv", extractcsv))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
 
     app.add_handler(CallbackQueryHandler(handle_category_callback, pattern=r"^(addcat|bulkcat|getcat):"))
-    app.add_handler(CallbackQueryHandler(handle_session_callback, pattern=r"^(sess|pending|itemused|itemunused|accountpage|accounttoggle|listpage):"))
+    app.add_handler(CallbackQueryHandler(handle_main_menu, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(handle_session_callback, pattern=r"^(sess|pending|itemused|itemunused|accountpage|accounttoggle|listpage|delconfirm|delcancel|delcatconfirm|delcatcancel|bulkconfirm|bulkcancel):"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_csv_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
