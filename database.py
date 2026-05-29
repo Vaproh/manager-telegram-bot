@@ -271,19 +271,28 @@ def add_accounts_bulk(items: Iterable[tuple[str, str]], category_id: int) -> dic
     }
 
 
-def search_accounts(term: str) -> list[sqlite3.Row]:
+def search_accounts(term: str, category: str | None = None, used: bool | None = None, newest_first: bool = True) -> list[sqlite3.Row]:
     term = term.strip()
     conn = connect()
-    rows = conn.execute(
-        """
-        SELECT a.id, a.username, a.password, c.name AS category, a.created_at
+    query = """
+        SELECT a.id, a.username, a.password, c.name AS category, a.created_at, a.used
         FROM accounts a
         JOIN categories c ON c.id = a.category_id
-        WHERE a.username LIKE ? OR a.password LIKE ? OR c.name LIKE ?
-        ORDER BY a.id DESC
-        """,
-        (f"%{term}%", f"%{term}%", f"%{term}%"),
-    ).fetchall()
+        WHERE (a.username LIKE ? OR a.password LIKE ? OR c.name LIKE ?)
+    """
+    params: list[object] = [f"%{term}%", f"%{term}%", f"%{term}%"]
+
+    if category:
+        query += " AND c.name LIKE ?"
+        params.append(f"%{category}%")
+
+    if used is not None:
+        query += " AND a.used = ?"
+        params.append(1 if used else 0)
+
+    query += " ORDER BY a.id DESC" if newest_first else " ORDER BY a.id ASC"
+
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return rows
 

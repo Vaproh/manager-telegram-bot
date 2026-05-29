@@ -118,6 +118,24 @@ def category_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton("➕ Add account", callback_data="menu:add"),
+            InlineKeyboardButton("📂 Get accounts", callback_data="menu:get"),
+        ],
+        [
+            InlineKeyboardButton("👥 Accounts", callback_data="menu:accounts"),
+            InlineKeyboardButton("📋 List", callback_data="menu:list"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Search", callback_data="menu:search"),
+            InlineKeyboardButton("📊 Stats", callback_data="menu:stats"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def fmt_account_block(index: int, username: str, password: str, category: str | None = None) -> str:
     category_line = f"\n│ <b>Category:</b> <code>{esc(category)}</code>" if category else ""
     return (
@@ -314,7 +332,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• /accounts — 👥 manage used/unused status\n"
         f"• /list — 📋 browse accounts page by page\n"
         f"• /bulkdelete — 🗑️ delete by IDs or category\n"
-        f"• /setstatus used|unused 1 2 — 🧭 update account status\n"
         f"• /extractcsv — 📄 extract email/user + password from CSV\n"
         f"• /stats — 📊 see bot usage stats\n"
         f"• /export — 💾 export the full account list"
@@ -950,7 +967,49 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    action = query.data.split(":", 1)[1] if ":" in query.data else ""
+    data = query.data or ""
+    action = data.split(":", 1)[1] if data.startswith("menu:") and ":" in data else data
+
+    if data == "menu:add":
+        await query.edit_message_text(
+            "<b>➕ Choose how to add an account</b>\n"
+            "Pick the method you want to use.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🧾 One account", callback_data="menu:add:single"),
+                    InlineKeyboardButton("📥 Bulk import", callback_data="menu:add:bulk"),
+                ],
+                [InlineKeyboardButton("⬅ Back", callback_data="menu:back")],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "menu:add:single":
+        await query.edit_message_text(
+            "<b>➕ Add one account</b>\n"
+            "Send: <code>/add username password</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "menu:add:bulk":
+        await query.edit_message_text(
+            "<b>📥 Bulk add</b>\n"
+            "Choose a category first, then send your accounts line by line.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "menu:back":
+        await query.edit_message_text(
+            "<b>✨ Quick menu</b>\n"
+            "Tap one of the buttons below to jump to the main actions.",
+            reply_markup=main_menu_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     help_text = {
         "add": "Use /add <username> <password> to save one account.",
         "get": "Use /getaccounts to retrieve unused accounts from a category.",
