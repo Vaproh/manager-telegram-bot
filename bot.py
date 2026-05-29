@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import html
 import io
 import logging
@@ -29,10 +30,13 @@ from database import (
     add_retrieval_item,
     create_retrieval_session,
     delete_account,
+    delete_accounts_by_ids,
+    delete_accounts_in_category,
     delete_category,
     export_accounts_csv,
     get_category_name,
     get_item,
+    get_category_id_by_name,
     get_accounts_for_category,
     get_unused_accounts_for_category,
     get_session,
@@ -83,6 +87,8 @@ init_db()
 pending_adds: dict[int, dict] = {}
 pending_bulk: dict[int, dict] = {}
 pending_gets: dict[int, dict] = {}
+pending_bulk_delete: dict[int, str] = {}
+pending_csv_extract: dict[int, bool] = {}
 
 
 def esc(value) -> str:
@@ -228,6 +234,10 @@ async def set_commands(app: Application) -> None:
         BotCommand("logs", "📜 View retrieval logs"),
         BotCommand("unused", "⏳ Pending retrieval items menu"),
         BotCommand("accounts", "👥 Manage account used status"),
+        BotCommand("list", "📋 List accounts"),
+        BotCommand("bulkdelete", "🗑️ Bulk delete accounts"),
+        BotCommand("setstatus", "🧭 Set account used/unused by ID"),
+        BotCommand("extractcsv", "📄 Extract User/Email + Password from CSV"),
         BotCommand("stats", "📊 Show statistics"),
         BotCommand("export", "💾 Export accounts as CSV"),
     ]
@@ -253,6 +263,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• /logs - 📜 recent retrieval logs\n"
         f"• /unused - ⏳ pending retrieval items menu\n"
         f"• /accounts - 👥 manage account used status\n"
+        f"• /list - 📋 list accounts\n"
+        f"• /bulkdelete - 🗑️ bulk delete by IDs or category\n"
+        f"• /setstatus used|unused 1 2 - 🧭 toggle account state by ID\n"
+        f"• /extractcsv - 📄 upload a CSV and extract User/Email + Password\n"
         f"• /stats - 📊 statistics\n"
         f"• /export - 💾 export CSV"
     )
@@ -492,6 +506,187 @@ async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
         parse_mode=ParseMode.HTML,
     )
+
+
+async def list_accounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    await accounts(update, context)
+
+
+async def bulkdelete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    if context.args:
+        raw = " ".join(context.args)
+        await _bulk_delete_from_input(update, raw)
+        return
+
+    pending_bulk_delete[update.effective_user.id] = "active"
+    await update.effective_message.reply_text(
+        "<b>🗑️ Bulk delete</b>\n"
+        "Send account IDs separated by spaces or commas, or a category name to delete all accounts in that category.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def setstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "<b>Usage</b>\n<code>🧭 /setstatus used 1 2 3</code> or <code>/setstatus unused 4</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    status = context.args[0].lower()
+    if status not in ("used", "unused"):
+        await update.effective_message.reply_text("<b>❗ Status must be used or unused</b>", parse_mode=ParseMode.HTML)
+        return
+
+    ids = []
+    for token in context.args[1:]:
+        try:
+            ids.append(int(token))
+        except ValueError:
+            continue
+
+    if not ids:
+        await update.effective_message.reply_text("<b>❗ No valid account IDs found</b>", parse_mode=ParseMode.HTML)
+        return
+
+    updated = 0
+    for account_id in ids:
+        if set_account_used(account_id, status == "used"):
+            updated += 1
+
+    await update.effective_message.reply_text(
+        f"<b>🧭 Updated {updated} account(s)</b> to <code>{status}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    logger.info("Set status %s for account ids=%s by user %s", status, ids, update.effective_user.id)
+
+
+async def extractcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    pending_csv_extract[update.effective_user.id] = True
+    await update.effective_message.reply_text(
+        "<b>📄 Upload a CSV file</b>\nI will extract the <b>User ID / Email Address</b> and <b>Password</b> columns into a new CSV.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _bulk_delete_from_input(update: Update, raw: str) -> None:
+    text = raw.strip()
+    if not text:
+        await update.effective_message.reply_text("<b>❗ Nothing to delete</b>", parse_mode=ParseMode.HTML)
+        return
+
+    ids = []
+    for token in text.replace(',', ' ').split():
+        try:
+            ids.append(int(token))
+        except ValueError:
+            pass
+
+    if ids:
+        deleted = delete_accounts_by_ids(ids)
+        await update.effective_message.reply_text(
+            f"<b>🗑️ Deleted {deleted} account(s)</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info("Bulk deleted accounts by user %s: ids=%s deleted=%s", update.effective_user.id, ids, deleted)
+        return
+
+    category_name = normalize_name(text)
+    category_id = get_category_id_by_name(category_name)
+    if category_id is None:
+        await update.effective_message.reply_text(
+            f"<b>❌ Category not found</b> <code>{esc(category_name)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    deleted = delete_accounts_in_category(category_id)
+    await update.effective_message.reply_text(
+        f"<b>🗑️ Deleted {deleted} account(s)</b> from <code>{esc(category_name)}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    logger.info("Bulk deleted accounts by user %s: category=%s deleted=%s", update.effective_user.id, category_name, deleted)
+
+
+async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_guard(update):
+        return
+
+    if update.effective_user.id not in pending_csv_extract:
+        return
+
+    document = update.effective_message.document
+    if not document:
+        return
+
+    try:
+        file = await document.get_file()
+        raw = await file.download_as_bytearray()
+    except Exception as exc:
+        logger.warning("CSV upload failed for user %s: %s", update.effective_user.id, exc)
+        await update.effective_message.reply_text("<b>❌ Could not read the uploaded CSV</b>", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        text = bytes(raw).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = bytes(raw).decode("cp1252", errors="ignore")
+
+    try:
+        from telegram import InputFile
+
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("No header row found")
+
+        user_header = None
+        password_header = None
+        for header in reader.fieldnames:
+            norm = (header or "").lower().replace(" ", "").replace("_", "").replace("-", "")
+            if user_header is None and any(token in norm for token in ("userid", "user", "email", "username", "account")):
+                user_header = header
+            if password_header is None and "password" in norm:
+                password_header = header
+
+        if not user_header or not password_header:
+            raise ValueError("Could not find the required columns")
+
+        out = io.StringIO(newline="")
+        writer = csv.writer(out)
+        writer.writerow(["User ID / Email Address", "Password"])
+        for row in reader:
+            writer.writerow([row.get(user_header, ""), row.get(password_header, "")])
+
+        bio = io.BytesIO(out.getvalue().encode("utf-8"))
+        bio.name = "extracted_accounts.csv"
+        bio.seek(0)
+        await update.effective_message.reply_document(
+            document=InputFile(bio, filename=bio.name),
+            caption="<b>📄 Extracted CSV</b>\nUser/Email + Password only.",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info("CSV extracted for user %s", update.effective_user.id)
+    except Exception as exc:
+        logger.warning("CSV extraction failed for user %s: %s", update.effective_user.id, exc)
+        await update.effective_message.reply_text(
+            "<b>❌ Could not extract the columns</b>\nMake sure the CSV has a User/Email column and a Password column.",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        pending_csv_extract.pop(update.effective_user.id, None)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -795,6 +990,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.effective_message.text or ""
 
+    if user_id in pending_bulk_delete:
+        pending_bulk_delete.pop(user_id, None)
+        await _bulk_delete_from_input(update, text)
+        return
+
     if user_id in pending_bulk:
         data = pending_bulk.pop(user_id)
         items, errors = parse_bulk_lines(text)
@@ -915,12 +1115,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("unused", unused))
     app.add_handler(CommandHandler("accounts", accounts))
+    app.add_handler(CommandHandler("list", list_accounts_cmd))
+    app.add_handler(CommandHandler("bulkdelete", bulkdelete))
+    app.add_handler(CommandHandler("setstatus", setstatus))
+    app.add_handler(CommandHandler("extractcsv", extractcsv))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
 
     app.add_handler(CallbackQueryHandler(handle_category_callback, pattern=r"^(addcat|bulkcat|getcat):"))
     app.add_handler(CallbackQueryHandler(handle_session_callback, pattern=r"^(sess|pending|itemused|itemunused|accountpage|accounttoggle):"))
-
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_csv_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     return app

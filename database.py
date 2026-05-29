@@ -204,6 +204,16 @@ def list_categories() -> list[sqlite3.Row]:
     return rows
 
 
+def get_category_id_by_name(name: str) -> int | None:
+    conn = connect()
+    row = conn.execute(
+        "SELECT id FROM categories WHERE LOWER(name) = LOWER(?)",
+        (name.strip(),),
+    ).fetchone()
+    conn.close()
+    return int(row["id"]) if row else None
+
+
 def add_account(username: str, password: str, category_id: int) -> tuple[bool, str, int | None]:
     username = username.strip()
     password = password.strip()
@@ -284,6 +294,26 @@ def delete_account(account_id: int) -> bool:
     conn.commit()
     conn.close()
     return cur.rowcount > 0
+
+
+def delete_accounts_by_ids(account_ids: Iterable[int]) -> int:
+    ids = list(dict.fromkeys(int(x) for x in account_ids))
+    if not ids:
+        return 0
+
+    conn = connect()
+    cur = conn.execute(f"DELETE FROM accounts WHERE id IN ({','.join('?' for _ in ids)})", ids)
+    conn.commit()
+    conn.close()
+    return int(cur.rowcount)
+
+
+def delete_accounts_in_category(category_id: int) -> int:
+    conn = connect()
+    cur = conn.execute("DELETE FROM accounts WHERE category_id = ?", (category_id,))
+    conn.commit()
+    conn.close()
+    return int(cur.rowcount)
 
 
 def get_accounts_for_category(category_id: int, limit: int) -> list[sqlite3.Row]:
